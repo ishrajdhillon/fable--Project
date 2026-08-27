@@ -6,92 +6,48 @@ type IncomingMessage = {
   content: string;
 };
 
-function getCurrentDate() {
-  return new Intl.DateTimeFormat("en-CA", {
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-    timeZone: "UTC",
-  }).format(new Date());
-}
-
-function shouldUseWebSearch(message: string) {
-  const text = message.toLowerCase();
-
-  const freshnessSignals = [
-    "today",
-    "tonight",
-    "tomorrow",
-    "yesterday",
-    "latest",
-    "recent",
-    "currently",
-    "current ",
-    "right now",
-    "this week",
-    "this month",
-    "this year",
-    "news",
-    "breaking",
-    "update",
-    "updated",
-    "price",
-    "stock",
-    "market",
-    "exchange rate",
-    "weather",
-    "forecast",
-    "score",
-    "standings",
-    "schedule",
-    "election",
-    "president",
-    "prime minister",
-    "ceo",
-    "immigration",
-    "express entry",
-    "pr draw",
-    "visa",
-    "work permit",
-    "law",
-    "policy",
-    "release date",
-    "new model",
-    "version",
-    "job opening",
-    "hiring",
-    "available now",
-    "open now",
-  ];
-
-  if (freshnessSignals.some((signal) => text.includes(signal))) {
-    return true;
+function getCurrentDate(timeZone: string) {
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+      weekday: "long",
+      timeZone,
+    }).format(new Date());
+  } catch {
+    return new Intl.DateTimeFormat("en-CA", {
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+      weekday: "long",
+      timeZone: "UTC",
+    }).format(new Date());
   }
-
-  // Explicit years close to the present are also a strong signal that fresh data may matter.
-  return /\b202[5-9]\b/.test(text);
 }
 
-function buildSystemPrompt(webSearchEnabled: boolean) {
-  const currentDate = getCurrentDate();
+function buildSystemPrompt(timeZone: string) {
+  const currentDate = getCurrentDate(timeZone);
 
   return `
 You are Fable, a capable, thoughtful, and friendly AI assistant.
 
-The current date is ${currentDate}.
-Do not claim that the current year is 2024 or rely on an old training cutoff when answering time-sensitive questions.
+The user's local date is ${currentDate}.
+The user's time zone is ${timeZone}.
+
+You have access to Google Search grounding on this request.
+Use Google Search whenever the answer could depend on current, recent, changing, or real-world information, including news, politics, immigration, laws, prices, sports, weather, companies, products, public figures, jobs, releases, schedules, or anything the user asks you to look up online.
+You do NOT need to search for timeless questions, writing help, brainstorming, explanations, math, or coding questions that do not require fresh information.
+Never say that you cannot browse or do not have internet access when Google Search grounding is available. If the user asks whether you can search the internet, explain that you can use Google Search for current information.
+Prefer fresh sources over model memory for time-sensitive questions.
+If sources disagree, say so clearly.
+Do not claim the current year is 2024.
 
 Help users think, write, code, learn, plan, and solve problems.
 Be clear and concise by default, but become detailed when asked.
 Use Markdown when it improves readability.
 For programming requests, give practical code and explain important decisions.
 Never claim to have completed actions you cannot actually perform.
-
-${
-  webSearchEnabled
-    ? "Google Search grounding is enabled for this request. Use it whenever the answer depends on current, recent, changing, or real-world information. Prefer fresh sources over model memory. If sources disagree, say so."
-    : "Google Search grounding is not enabled for this request. If the user asks for information that may have changed recently, do not pretend your internal knowledge is current."
-}
 `;
 }
 
@@ -111,7 +67,9 @@ function appendSources(text: string, response: any) {
     }));
 
   const uniqueSources = Array.from(
-    new Map(sources.map((source: { title: string; url: string }) => [source.url, source])).values()
+    new Map(
+      sources.map((source: { title: string; url: string }) => [source.url, source])
+    ).values()
   ).slice(0, 5) as { title: string; url: string }[];
 
   if (uniqueSources.length === 0) {
@@ -136,6 +94,10 @@ export async function POST(request: Request) {
 
     const body = await request.json();
     const messages = body.messages as IncomingMessage[];
+    const timeZone =
+      typeof body.timeZone === "string" && body.timeZone.length < 100
+        ? body.timeZone
+        : "UTC";
 
     if (!Array.isArray(messages) || messages.length === 0) {
       return NextResponse.json(
@@ -156,43 +118,31 @@ export async function POST(request: Request) {
         parts: [{ text: message.content.slice(0, 12000) }],
       }));
 
-    const latestUserMessage = [...messages]
-      .reverse()
-      .find((message) => message.role === "user")?.content ?? "";
-
-    const useWebSearch = shouldUseWebSearch(latestUserMessage);
     const ai = getGeminiClient();
 
-    // Gemini 2.5 Flash currently supports Google Search grounding on the free tier
-    // (subject to Google's daily quota), while keeping the normal model for everyday chat.
-    const model = useWebSearch
-      ? process.env.GEMINI_SEARCH_MODEL || "gemini-2.5-flash"
-      : process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
+    // Gemini 3.5 Flash-Lite supports Google Search grounding.
+    // The model decides whether a search is actually useful for each request.
+    const model = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 
     const response = await ai.models.generateContent({
       model,
       contents: sanitized,
       config: {
-        systemInstruction: buildSystemPrompt(useWebSearch),
-        ...(useWebSearch
-          ? {
-              tools: [
-                {
-                  googleSearch: {},
-                },
-              ],
-            }
-          : {}),
+        systemInstruction: buildSystemPrompt(timeZone),
+        tools: [
+          {
+            googleSearch: {},
+          },
+        ],
       },
     });
 
     const rawText = response.text || "I couldn't generate a response.";
-    const message = useWebSearch ? appendSources(rawText, response) : rawText;
+    const message = appendSources(rawText, response);
 
     return NextResponse.json({
       message,
-      searchedWeb: useWebSearch,
-      currentDate: getCurrentDate(),
+      currentDate: getCurrentDate(timeZone),
     });
   } catch (error) {
     console.error("Fable Gemini API error:", error);
