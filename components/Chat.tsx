@@ -28,7 +28,6 @@ const suggestions = [
   },
 ];
 
-
 export default function Chat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [theme, setTheme] = useState<"light" | "dark">("light");
@@ -88,11 +87,14 @@ export default function Chat() {
     setError("");
 
     try {
+      const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           messages: nextMessages.map(({ role, content }) => ({ role, content })),
+          timeZone,
         }),
       });
 
@@ -154,13 +156,11 @@ export default function Chat() {
               Under construction
             </div>
 
-            <p>
-              Chat history and accounts are coming soon.
-            </p>
+            <p>Chat history and accounts are coming soon.</p>
           </div>
         </div>
 
-        <div className="sidebar-footer">fable.space · AI workspace</div>
+        <div className="sidebar-footer">fabel.space · AI workspace</div>
       </aside>
 
       <main className="main">
