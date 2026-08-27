@@ -26,7 +26,59 @@ function getCurrentDate(timeZone: string) {
   }
 }
 
-function buildSystemPrompt(timeZone: string) {
+function shouldUseWebSearch(message: string) {
+  const text = message.toLowerCase();
+
+  const signals = [
+    "today",
+    "tonight",
+    "tomorrow",
+    "yesterday",
+    "latest",
+    "recent",
+    "currently",
+    "current ",
+    "right now",
+    "this week",
+    "this month",
+    "this year",
+    "news",
+    "breaking",
+    "update",
+    "updated",
+    "price",
+    "stock",
+    "market",
+    "exchange rate",
+    "weather",
+    "forecast",
+    "score",
+    "standings",
+    "schedule",
+    "election",
+    "president",
+    "prime minister",
+    "ceo",
+    "immigration",
+    "express entry",
+    "pr draw",
+    "visa",
+    "work permit",
+    "law",
+    "policy",
+    "release date",
+    "job opening",
+    "hiring",
+    "search the internet",
+    "search online",
+    "look up",
+    "find online",
+  ];
+
+  return signals.some((signal) => text.includes(signal)) || /\b202[5-9]\b/.test(text);
+}
+
+function buildSystemPrompt(timeZone: string, webSearchEnabled: boolean) {
   const currentDate = getCurrentDate(timeZone);
 
   return `
@@ -34,14 +86,13 @@ You are Fable, a capable, thoughtful, and friendly AI assistant.
 
 The user's local date is ${currentDate}.
 The user's time zone is ${timeZone}.
-
-You have access to Google Search grounding on this request.
-Use Google Search whenever the answer could depend on current, recent, changing, or real-world information, including news, politics, immigration, laws, prices, sports, weather, companies, products, public figures, jobs, releases, schedules, or anything the user asks you to look up online.
-You do NOT need to search for timeless questions, writing help, brainstorming, explanations, math, or coding questions that do not require fresh information.
-Never say that you cannot browse or do not have internet access when Google Search grounding is available. If the user asks whether you can search the internet, explain that you can use Google Search for current information.
-Prefer fresh sources over model memory for time-sensitive questions.
-If sources disagree, say so clearly.
 Do not claim the current year is 2024.
+
+${
+  webSearchEnabled
+    ? "Google Search grounding is enabled for this request. Use it for current or changing information and prefer fresh sources over model memory."
+    : "Google Search is not enabled for this request. Answer from your general knowledge, and do not pretend stale information is current."
+}
 
 Help users think, write, code, learn, plan, and solve problems.
 Be clear and concise by default, but become detailed when asked.
@@ -54,9 +105,7 @@ Never claim to have completed actions you cannot actually perform.
 function appendSources(text: string, response: any) {
   const chunks = response?.candidates?.[0]?.groundingMetadata?.groundingChunks;
 
-  if (!Array.isArray(chunks)) {
-    return text;
-  }
+  if (!Array.isArray(chunks)) return text;
 
   const sources = chunks
     .map((chunk: any) => chunk?.web)
@@ -72,9 +121,7 @@ function appendSources(text: string, response: any) {
     ).values()
   ).slice(0, 5) as { title: string; url: string }[];
 
-  if (uniqueSources.length === 0) {
-    return text;
-  }
+  if (uniqueSources.length === 0) return text;
 
   const sourceList = uniqueSources
     .map((source, index) => `${index + 1}. [${source.title}](${source.url})`)
@@ -83,11 +130,16 @@ function appendSources(text: string, response: any) {
   return `${text}\n\n---\n**Sources**\n${sourceList}`;
 }
 
+function isQuotaError(error: unknown) {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.includes("429") || text.includes("RESOURCE_EXHAUSTED") || text.toLowerCase().includes("quota");
+}
+
 export async function POST(request: Request) {
   try {
     if (!process.env.GEMINI_API_KEY) {
       return NextResponse.json(
-        { error: "GEMINI_API_KEY is missing. Add it to .env.local." },
+        { error: "Fable is temporarily unavailable because the AI key is not configured." },
         { status: 500 }
       );
     }
@@ -100,10 +152,7 @@ export async function POST(request: Request) {
         : "UTC";
 
     if (!Array.isArray(messages) || messages.length === 0) {
-      return NextResponse.json(
-        { error: "A message is required." },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "A message is required." }, { status: 400 });
     }
 
     const sanitized = messages
@@ -118,41 +167,58 @@ export async function POST(request: Request) {
         parts: [{ text: message.content.slice(0, 12000) }],
       }));
 
-    const ai = getGeminiClient();
+    const latestUserMessage = [...messages]
+      .reverse()
+      .find((message) => message.role === "user")?.content ?? "";
 
-    // Gemini 3.5 Flash-Lite supports Google Search grounding.
-    // The model decides whether a search is actually useful for each request.
+    const useWebSearch = shouldUseWebSearch(latestUserMessage);
+    const ai = getGeminiClient();
     const model = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 
-    const response = await ai.models.generateContent({
-      model,
-      contents: sanitized,
-      config: {
-        systemInstruction: buildSystemPrompt(timeZone),
-        tools: [
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents: sanitized,
+        config: {
+          systemInstruction: buildSystemPrompt(timeZone, useWebSearch),
+          ...(useWebSearch
+            ? {
+                tools: [
+                  {
+                    googleSearch: {},
+                  },
+                ],
+              }
+            : {}),
+        },
+      });
+
+      const rawText = response.text || "I couldn't generate a response.";
+      const message = useWebSearch ? appendSources(rawText, response) : rawText;
+
+      return NextResponse.json({
+        message,
+        currentDate: getCurrentDate(timeZone),
+        searchedWeb: useWebSearch,
+      });
+    } catch (error) {
+      if (isQuotaError(error)) {
+        return NextResponse.json(
           {
-            googleSearch: {},
+            error:
+              "Fable has temporarily reached its free AI usage limit. Please try again later. The limit resets automatically based on Google's quota window.",
           },
-        ],
-      },
-    });
-
-    const rawText = response.text || "I couldn't generate a response.";
-    const message = appendSources(rawText, response);
-
-    return NextResponse.json({
-      message,
-      currentDate: getCurrentDate(timeZone),
-    });
+          { status: 429 }
+        );
+      }
+      throw error;
+    }
   } catch (error) {
     console.error("Fable Gemini API error:", error);
 
-    const detail =
-      error instanceof Error ? error.message : "Unknown Gemini API error.";
-
     return NextResponse.json(
       {
-        error: `Fable could not reach Gemini. ${detail}`,
+        error: "Fable couldn't complete that request right now. Please try again in a moment.",
       },
       { status: 500 }
     );
